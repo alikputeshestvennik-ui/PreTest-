@@ -1,0 +1,86 @@
+name: Build Blackbox Ecosystem (Phone, Galaxy Watch, Rewind)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK, NDK and CMake
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;25.2.9519653" "cmake;3.22.1"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Unpack Project Zip (if present)
+        run: |
+          ZIP_NAME=$(ls -1 Blackbox*.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP_NAME" ]; then
+            ZIP_NAME=$(ls -1 *.zip 2>/dev/null | head -n 1)
+          fi
+
+          if [ -n "$ZIP_NAME" ]; then
+            echo "Unpacking $ZIP_NAME..."
+            unzip -q -o "$ZIP_NAME"
+          fi
+          if [ -d "BlackboxOffline_WHISPER_COMPACT" ]; then
+            echo "Moving files from BlackboxOffline_WHISPER_COMPACT to root..."
+            cp -rf BlackboxOffline_WHISPER_COMPACT/* .
+            cp -rf BlackboxOffline_WHISPER_COMPACT/.[!.]* . 2>/dev/null || true
+            rm -rf BlackboxOffline_WHISPER_COMPACT
+          fi
+
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "ndk.dir=$ANDROID_HOME/ndk/25.2.9519653" >> local.properties
+          touch gradle.properties
+          grep -q "android.useAndroidX" gradle.properties || echo "android.useAndroidX=true" >> gradle.properties
+          grep -q "android.enableJetifier" gradle.properties || echo "android.enableJetifier=true" >> gradle.properties
+
+      - name: Build Both Modules (:app and :wear)
+        run: |
+          gradle :app:assembleRelease :wear:assembleRelease --no-daemon
+
+      - name: Sign Both APKs with Shared Keystore
+        run: |
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ ! -f "blackbox_shared.jks" ]; then
+            keytool -genkeypair -keystore blackbox_shared.jks -storepass blackbox2026 -keypass blackbox2026 -alias blackbox -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Blackbox Offline, O=Blackbox, C=RU"
+          fi
+
+          mkdir -p output_apks
+
+          # 1. Sign Phone Flagship APK
+          $SDK_DIR/build-tools/35.0.0/zipalign -f -p 4 app/build/outputs/apk/release/app-release-unsigned.apk phone-aligned.apk
+          $SDK_DIR/build-tools/35.0.0/apksigner sign --ks blackbox_shared.jks --ks-key-alias blackbox --ks-pass pass:blackbox2026 --key-pass pass:blackbox2026 --out output_apks/BlackboxPhone.apk phone-aligned.apk
+          $SDK_DIR/build-tools/35.0.0/apksigner verify output_apks/BlackboxPhone.apk
+
+          # 2. Sign Galaxy Watch Wear OS APK
+          $SDK_DIR/build-tools/35.0.0/zipalign -f -p 4 wear/build/outputs/apk/release/wear-release-unsigned.apk wear-aligned.apk
+          $SDK_DIR/build-tools/35.0.0/apksigner sign --ks blackbox_shared.jks --ks-key-alias blackbox --ks-pass pass:blackbox2026 --key-pass pass:blackbox2026 --out output_apks/BlackboxWatch.apk wear-aligned.apk
+          $SDK_DIR/build-tools/35.0.0/apksigner verify output_apks/BlackboxWatch.apk
+
+          echo "APKs signed successfully!"
+          ls -lh output_apks/
+
+      - name: Upload Both APKs (Phone + Watch for Bugjaeger)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blackbox-Phone-and-Watch-APKs
+          path: output_apks/*.apk
+          if-no-files-found: error
